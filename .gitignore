@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Virtuální prostředí
+.venv/
+venv/
+env/
+ENV/
+
+# Výstupní soubory (generovaný obsah, ne zdrojový kód)
+output/
+
+# IDE a editory
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# pytest / testovací artefakty
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Distribuční balíčky
+*.whl
+*.tar.gz

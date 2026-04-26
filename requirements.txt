@@ -1,0 +1,3 @@
+# Závislosti projektu
+# numpy není potřeba – veškerá matematika je ve standardní knihovně (math)
+matplotlib>=3.5.0
