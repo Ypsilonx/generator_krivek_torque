@@ -272,3 +272,235 @@ def save_csv(data: List[Tuple[float, float]], filepath: str) -> str:
             writer.writerow([f"{torque:.2f}", f"{angle:.0f}"])
 
     return os.path.abspath(filepath)
+
+
+# ---------------------------------------------------------------------------
+# Import dat z Excelu
+# ---------------------------------------------------------------------------
+
+def _is_numeric(val: object) -> bool:
+    """Vrátí True pokud lze val převést na float."""
+    try:
+        float(val)  # type: ignore[arg-type]
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def load_xlsx(filepath: str) -> Tuple[List[Tuple[float, float]], List[dict]]:
+    """Načte momentová data z Excel souboru (.xlsx) a provede validaci.
+
+    Očekávaný formát: sloupec A = Moment [Nm], sloupec B = Úhel [°].
+    První řádek může být hlavičkový – detekce je automatická.
+    Data jsou seřazena dle úhlu a normalizována (start na 0°).
+
+    Args:
+        filepath: Cesta k .xlsx souboru
+
+    Returns:
+        Tuple (data, issues) kde:
+            data   – List[(torque, angle)] – očištěná, seřazená, normalizovaná data
+            issues – List[dict] s klíči:
+                       'level'   – 'info' / 'warning' / 'error'
+                       'message' – popis problému
+                       'count'   – počet postižených řádků
+                       'outlier_indices' – (volitelné) indexy odlehlých hodnot
+
+    Raises:
+        ImportError: openpyxl není nainstalován
+        FileNotFoundError: soubor neexistuje
+        ValueError: soubor neobsahuje žádná platná data
+    """
+    try:
+        import openpyxl  # noqa: PLC0415
+    except ImportError:
+        raise ImportError(
+            "openpyxl není nainstalován. Spusťte: pip install openpyxl"
+        )
+
+    if not os.path.isfile(filepath):
+        raise FileNotFoundError(f"Soubor nenalezen: {filepath}")
+
+    wb = openpyxl.load_workbook(filepath, read_only=True, data_only=True)
+    ws = wb.active
+    rows = list(ws.iter_rows(values_only=True))
+    wb.close()
+
+    issues: List[dict] = []
+
+    # Detekce hlavičkového řádku – přeskočíme pokud první buňka není číslo
+    start = 0
+    if rows and not _is_numeric(rows[0][0] if rows[0] else None):
+        start = 1
+
+    skipped_missing = 0
+    skipped_nonnumeric = 0
+    raw: List[Tuple[float, float]] = []
+
+    for row in rows[start:]:
+        if not row or len(row) < 2:
+            skipped_missing += 1
+            continue
+        t_val, a_val = row[0], row[1]
+        if t_val is None or a_val is None:
+            skipped_missing += 1
+            continue
+        if not _is_numeric(t_val) or not _is_numeric(a_val):
+            skipped_nonnumeric += 1
+            continue
+        raw.append((float(t_val), float(a_val)))
+
+    if skipped_missing:
+        issues.append({
+            "level": "warning",
+            "message": f"{skipped_missing} řádků přeskočeno – chybějící hodnota",
+            "count": skipped_missing,
+        })
+    if skipped_nonnumeric:
+        issues.append({
+            "level": "warning",
+            "message": f"{skipped_nonnumeric} řádků přeskočeno – nečíselná hodnota",
+            "count": skipped_nonnumeric,
+        })
+
+    if not raw:
+        raise ValueError("Soubor neobsahuje žádná platná data (Torque + Angle).")
+
+    # Deduplikace – u stejného úhlu zachovat první výskyt
+    seen_angles: dict = {}
+    deduped: List[Tuple[float, float]] = []
+    dup_count = 0
+    for t, a in raw:
+        key = round(a, 6)
+        if key in seen_angles:
+            dup_count += 1
+        else:
+            seen_angles[key] = True
+            deduped.append((t, a))
+    if dup_count:
+        issues.append({
+            "level": "warning",
+            "message": f"{dup_count} duplicitních úhlů – zachována první hodnota",
+            "count": dup_count,
+        })
+
+    # Seřazení dle úhlu
+    sorted_data = sorted(deduped, key=lambda x: x[1])
+    if sorted_data != deduped:
+        issues.append({
+            "level": "info",
+            "message": "Data seřazena dle úhlu vzestupně",
+            "count": 0,
+        })
+
+    # Normalizace – úhly začínají od 0
+    min_angle = sorted_data[0][1]
+    if abs(min_angle) > 1e-6:
+        sorted_data = [(t, round(a - min_angle, 4)) for t, a in sorted_data]
+        issues.append({
+            "level": "info",
+            "message": f"Úhly posunuty o {min_angle:.2f}° (normalizace na 0)",
+            "count": 0,
+        })
+
+    # Detekce neobvyklých mezer v úhlové sekvenci
+    if len(sorted_data) > 2:
+        angles_seq = [a for _, a in sorted_data]
+        gaps = [angles_seq[i + 1] - angles_seq[i] for i in range(len(angles_seq) - 1)]
+        avg_gap = sum(gaps) / len(gaps)
+        threshold = max(avg_gap * 5.0, 1.0)
+        large_gap_count = sum(1 for g in gaps if g > threshold)
+        if large_gap_count:
+            issues.append({
+                "level": "warning",
+                "message": f"{large_gap_count} neobvyklých mezer v úhlové sekvenci (možná chybějící data)",
+                "count": large_gap_count,
+            })
+
+    # Detekce odlehlých hodnot momentu (> 3σ od průměru)
+    outlier_indices: List[int] = []
+    if len(sorted_data) > 10:
+        torques_vals = [t for t, _ in sorted_data]
+        mean_t = sum(torques_vals) / len(torques_vals)
+        variance = sum((t - mean_t) ** 2 for t in torques_vals) / len(torques_vals)
+        sigma = variance ** 0.5
+        if sigma > 1e-9:
+            outlier_indices = [
+                i for i, t in enumerate(torques_vals) if abs(t - mean_t) > 3 * sigma
+            ]
+        if outlier_indices:
+            issues.append({
+                "level": "warning",
+                "message": (
+                    f"{len(outlier_indices)} potenciálních odlehlých hodnot momentu"
+                    " (> 3σ od průměru) – lze odebrat tlačítkem"
+                ),
+                "count": len(outlier_indices),
+                "outlier_indices": outlier_indices,
+            })
+
+    if not issues:
+        issues.append({
+            "level": "info",
+            "message": "Žádné anomálie nenalezeny – data jsou v pořádku",
+            "count": 0,
+        })
+
+    return sorted_data, issues
+
+
+def generate_curve_from_data(
+    imported_data: List[Tuple[float, float]],
+    ramp_type: str = "hybrid",
+    ramp_degrees: float = 45.0,
+    end_with_block: bool = False,
+    block_torque: float = 50.0,
+) -> List[Tuple[float, float]]:
+    """Generuje momentovou křivku z importovaných (reálných) dat.
+
+    Sekvence: náběhová fáze → importovaná data (pracovní fáze) → volitelný blok.
+    Náběh cílí na PRVNÍ hodnotu importovaných dat – zajistí plynulé napojení.
+    Importovaná data jsou posunuta o délku náběhu; jejich relativní úhly jsou zachovány.
+
+    Args:
+        imported_data: Data ve formátu (torque, angle) – normalizovaná na start 0°
+        ramp_type: Typ náběhu – 'hybrid', 'exponential', 'scurve', 'linear'
+        ramp_degrees: Délka náběhové fáze [°] (>= 0)
+        end_with_block: Přidat blokový moment na konec (3 body)
+        block_torque: Hodnota blokového momentu [Nm]
+
+    Returns:
+        List dvojic (torque [Nm], angle [°]) s kladnými hodnotami
+
+    Raises:
+        ValueError: Pro neplatné vstupní parametry
+    """
+    if not imported_data:
+        raise ValueError("Importovaná data jsou prázdná.")
+    if ramp_degrees < 0:
+        raise ValueError(f"Úhel náběhu nesmí být záporný, zadáno: {ramp_degrees}")
+    if ramp_type not in _RAMP_FUNCTIONS:
+        raise ValueError(f"Neznámý typ náběhu: '{ramp_type}'. Platné: {RAMP_TYPES}")
+
+    ramp_fn = _RAMP_FUNCTIONS[ramp_type]
+    # Cíl náběhu = absolutní hodnota prvního momentu (kladná konvence jako generate_curve)
+    first_torque = abs(imported_data[0][0])
+    data: List[Tuple[float, float]] = []
+
+    # Náběhová fáze: 0° až ramp_degrees (výhradně – první bod importu je na ramp_degrees)
+    if ramp_degrees > 0:
+        for angle in range(int(ramp_degrees)):
+            torque = ramp_fn(float(angle), ramp_degrees, first_torque)
+            data.append((round(torque, 2), float(angle)))
+
+    # Pracovní fáze: importovaná data posunutá o délku náběhu
+    for t, a in imported_data:
+        data.append((round(t, 2), round(a + ramp_degrees, 2)))
+
+    # Blokový moment na konci (3 body jako v generate_curve)
+    if end_with_block:
+        final_angle = data[-1][1]
+        for i in range(1, 4):
+            data.append((round(block_torque, 2), final_angle + i))
+
+    return data

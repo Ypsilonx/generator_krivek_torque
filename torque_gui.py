@@ -52,7 +52,8 @@ class TorqueCurveGeneratorGUI:
 
         self.root = tk.Tk()
         self.root.title("Torque Curve Generator – LH/RH Motor Support")
-        self.root.geometry("1160x730")
+        self.root.geometry("1600x900")
+        self.root.minsize(1200, 640)
         self.root.configure(bg="#f0f0f0")
 
         # --- stavové proměnné ---
@@ -74,6 +75,11 @@ class TorqueCurveGeneratorGUI:
         self._last_raw_data: Optional[List[Tuple[float, float]]] = None
         # ID pendingového after() volání pro debouncing live preview
         self._chart_after_id: Optional[str] = None
+        # Import mód – importovaná data a metadata
+        self._imported_data: Optional[List[Tuple[float, float]]] = None
+        self._imported_filename: str = ""
+        self._outlier_indices: List[int] = []
+        self._active_tab: int = 0  # 0 = Parametry, 1 = Import XLSX
 
         self._setup_gui()
         self._setup_auto_update_callbacks()
@@ -84,22 +90,61 @@ class TorqueCurveGeneratorGUI:
     # -----------------------------------------------------------------------
 
     def _setup_gui(self):
-        """Sestaví celé GUI – titulní lišta + dvoupanelový layout."""
+        """Sestaví celé GUI – titulní lišta + dvoupanelový layout s záložkami pro zdroj dat."""
         self._create_title_bar()
 
         content = tk.Frame(self.root, bg="#f0f0f0")
         content.pack(fill=tk.BOTH, expand=True, padx=14, pady=8)
 
-        # Levý sloupec – ovládací prvky (pevná šířka 390 px)
-        left = tk.Frame(content, bg="#f0f0f0", width=390)
-        left.pack(side=tk.LEFT, fill=tk.Y)
-        left.pack_propagate(False)
+        # Levý sloupec – scrollovatelný panel (pevná šířka 400 px)
+        left_outer = tk.Frame(content, bg="#f0f0f0", width=430)
+        left_outer.pack(side=tk.LEFT, fill=tk.Y)
+        left_outer.pack_propagate(False)
+
+        left_canvas = tk.Canvas(left_outer, bg="#f0f0f0", highlightthickness=0, width=413)
+        left_scroll = tk.Scrollbar(left_outer, orient="vertical", command=left_canvas.yview)
+        left_canvas.configure(yscrollcommand=left_scroll.set)
+        left_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        left_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # Vnitřní frame – do něj jde veškerý obsah levého panelu
+        left = tk.Frame(left_canvas, bg="#f0f0f0")
+        left_canvas_window = left_canvas.create_window((0, 0), window=left, anchor="nw")
+
+        def _on_left_configure(event):
+            left_canvas.configure(scrollregion=left_canvas.bbox("all"))
+
+        def _on_canvas_resize(event):
+            left_canvas.itemconfig(left_canvas_window, width=event.width)
+
+        left.bind("<Configure>", _on_left_configure)
+        left_canvas.bind("<Configure>", _on_canvas_resize)
+
+        # Scroll kolečkem myši nad levým panelem
+        def _on_mousewheel(event):
+            left_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        left_canvas.bind("<Enter>", lambda _e: left_canvas.bind_all("<MouseWheel>", _on_mousewheel))
+        left_canvas.bind("<Leave>", lambda _e: left_canvas.unbind_all("<MouseWheel>"))
 
         # Pravý sloupec – graf + výsledky
         right = tk.Frame(content, bg="#f0f0f0")
         right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(12, 0))
 
-        self._create_torque_section(left)
+        # Záložky pro výběr zdroje dat
+        self._notebook = ttk.Notebook(left)
+        self._notebook.pack(fill=tk.X, pady=(0, 4))
+
+        tab_gen = tk.Frame(self._notebook, bg="#f0f0f0")
+        tab_imp = tk.Frame(self._notebook, bg="#f0f0f0")
+        self._notebook.add(tab_gen, text="  Parametry  ")
+        self._notebook.add(tab_imp, text="  Import XLSX  ")
+        self._notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+
+        self._create_torque_section(tab_gen)
+        self._create_import_section(tab_imp)
+
+        # Sdílené sekce – platí pro oba módy
         self._create_ramp_section(left)
         self._create_motor_section(left)
         self._create_file_section(left)
@@ -142,13 +187,181 @@ class TorqueCurveGeneratorGUI:
         self._range_entry = tk.Entry(frame, textvariable=self.working_rotations, width=10)
         self._range_entry.grid(row=2, column=1, padx=4, pady=4)
 
-        bf = tk.Frame(frame, bg="#f0f0f0")
-        bf.grid(row=3, column=0, columnspan=3, sticky="w", padx=8, pady=4)
-        tk.Checkbutton(bf, text="Ukončit blokem", variable=self.end_with_block,
-                       bg="#f0f0f0", command=self._on_block_change).pack(side=tk.LEFT)
-        self._block_entry = tk.Entry(bf, textvariable=self.block_torque, width=8, state="disabled")
-        self._block_entry.pack(side=tk.LEFT, padx=(8, 0))
-        tk.Label(bf, text="Nm", bg="#f0f0f0").pack(side=tk.LEFT, padx=(2, 0))
+    def _create_import_section(self, parent):
+        """Záložka pro import reálných dat momentové křivky z Excel souboru."""
+        from tkinter import filedialog  # noqa: PLC0415 – odložený import, tkinter je vždy k dispozici
+
+        # --- Výběr souboru ---
+        file_frame = tk.LabelFrame(parent, text="Excel soubor (.xlsx)",
+                                   font=("Arial", 9, "bold"), bg="#f0f0f0", fg="#2c3e50")
+        file_frame.pack(fill=tk.X, padx=4, pady=(6, 4))
+
+        path_row = tk.Frame(file_frame, bg="#f0f0f0")
+        path_row.pack(fill=tk.X, padx=8, pady=(6, 2))
+
+        self._xlsx_path = tk.StringVar(value="")
+        tk.Entry(path_row, textvariable=self._xlsx_path, state="readonly",
+                 font=("Consolas", 8), relief="sunken").pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Button(path_row, text="Procházet…", font=("Arial", 8),
+                  bg="#3498db", fg="white",
+                  command=self._browse_xlsx).pack(side=tk.LEFT, padx=(4, 0))
+
+        self._import_stats = tk.Label(
+            file_frame, text="Soubor není načten.",
+            font=("Consolas", 8), bg="#f0f0f0", fg="#7f8c8d",
+            justify=tk.LEFT, anchor="w",
+        )
+        self._import_stats.pack(fill=tk.X, padx=8, pady=(2, 6))
+
+        # --- Validace ---
+        val_frame = tk.LabelFrame(parent, text="Validace a anomálie",
+                                  font=("Arial", 9, "bold"), bg="#f0f0f0", fg="#2c3e50")
+        val_frame.pack(fill=tk.X, padx=4, pady=(0, 4))
+
+        self._validation_text = tk.Text(
+            val_frame, height=5, font=("Consolas", 8),
+            bg="#2c3e50", fg="#ecf0f1", state=tk.DISABLED,
+            insertbackground="white", relief="flat",
+        )
+        self._validation_text.pack(fill=tk.X, padx=6, pady=4)
+
+        self._btn_remove_outliers = tk.Button(
+            val_frame, text="Odebrat odlehlé hodnoty",
+            command=self._remove_outliers,
+            bg="#e67e22", fg="white", font=("Arial", 8),
+            state="disabled",
+        )
+        self._btn_remove_outliers.pack(anchor="w", padx=6, pady=(0, 6))
+
+    def _browse_xlsx(self):
+        """Otevře dialog pro výběr .xlsx souboru a spustí jeho načtení."""
+        from tkinter import filedialog  # noqa: PLC0415
+        path = filedialog.askopenfilename(
+            title="Vyberte Excel soubor s momentovými daty",
+            filetypes=[("Excel soubory", "*.xlsx"), ("Všechny soubory", "*.*")],
+        )
+        if path:
+            self._xlsx_path.set(path)
+            self._load_xlsx_file(path)
+
+    def _load_xlsx_file(self, filepath: str):
+        """Spustí načtení xlsx v separátním vlákně (UI zůstane responzivní)."""
+        self._set_validation_text("Načítám soubor…\n")
+        self._import_stats.config(text="Zpracovávám…", fg="#7f8c8d")
+        threading.Thread(
+            target=self._load_xlsx_thread, args=(filepath,), daemon=True
+        ).start()
+
+    def _load_xlsx_thread(self, filepath: str):
+        """Provede načtení a validaci xlsx (běží v threadu)."""
+        try:
+            data, issues = engine.load_xlsx(filepath)
+            self.root.after(0, lambda: self._on_xlsx_loaded(filepath, data, issues))
+        except Exception as exc:  # noqa: BLE001
+            msg = str(exc)
+            self.root.after(0, lambda: self._on_xlsx_error(msg))
+
+    def _on_xlsx_loaded(
+        self, filepath: str,
+        data: List[Tuple[float, float]],
+        issues: List[dict],
+    ):
+        """Zpracuje výsledky načtení xlsx ve hlavním vlákně."""
+        self._imported_data = data
+        self._imported_filename = os.path.splitext(os.path.basename(filepath))[0]
+
+        # Najdeme outlier_indices z issues (pokud existují)
+        self._outlier_indices = []
+        for issue in issues:
+            if "outlier_indices" in issue:
+                self._outlier_indices = issue["outlier_indices"]
+                break
+
+        self._btn_remove_outliers.config(
+            state="normal" if self._outlier_indices else "disabled"
+        )
+
+        # Statistiky souboru
+        torques_v = [t for t, _ in data]
+        angles_v  = [a for _, a in data]
+        self._import_stats.config(
+            text=(
+                f"Bodů: {len(data):,}   "
+                f"Úhly: {angles_v[0]:.0f}° – {angles_v[-1]:.0f}°"
+                f"  ({angles_v[-1] / 360:.1f} ot.)\n"
+                f"Moment: {min(torques_v):.2f} – {max(torques_v):.2f} Nm"
+                f"  (prům. {sum(torques_v)/len(torques_v):.2f} Nm)"
+            ),
+            fg="#27ae60",
+        )
+
+        # Výsledky validace s ikonami
+        level_icon = {"info": "✓ ", "warning": "⚠ ", "error": "✗ "}
+        self._validation_text.config(state=tk.NORMAL)
+        self._validation_text.delete(1.0, tk.END)
+        for issue in issues:
+            icon = level_icon.get(issue["level"], "  ")
+            self._validation_text.insert(tk.END, f"{icon}{issue['message']}\n")
+        self._validation_text.config(state=tk.DISABLED)
+
+        # Auto-název souboru
+        if self.auto_update_filename.get():
+            self._generate_auto_filename()
+
+        self._schedule_chart_refresh()
+
+    def _on_xlsx_error(self, message: str):
+        """Zobrazí chybu načtení xlsx ve hlavním vlákně."""
+        self._imported_data = None
+        self._import_stats.config(text="Chyba při načítání souboru.", fg="#e74c3c")
+        self._set_validation_text(f"✗ CHYBA: {message}\n")
+        self._btn_remove_outliers.config(state="disabled")
+
+    def _remove_outliers(self):
+        """Odebere odlehlé hodnoty momentu z importovaných dat a obnoví graf."""
+        if not self._imported_data or not self._outlier_indices:
+            return
+        idx_set = set(self._outlier_indices)
+        count = len(idx_set)
+        self._imported_data = [
+            pt for i, pt in enumerate(self._imported_data) if i not in idx_set
+        ]
+        self._outlier_indices = []
+        self._btn_remove_outliers.config(state="disabled")
+
+        # Aktualizace statistik
+        torques_v = [t for t, _ in self._imported_data]
+        angles_v  = [a for _, a in self._imported_data]
+        self._import_stats.config(
+            text=(
+                f"Bodů: {len(self._imported_data):,}   "
+                f"Úhly: {angles_v[0]:.0f}° – {angles_v[-1]:.0f}°\n"
+                f"Moment: {min(torques_v):.2f} – {max(torques_v):.2f} Nm"
+                f"  (prům. {sum(torques_v)/len(torques_v):.2f} Nm)"
+            ),
+            fg="#27ae60",
+        )
+        self._validation_text.config(state=tk.NORMAL)
+        self._validation_text.insert(tk.END, f"✓ Odebráno {count} odlehlých hodnot\n")
+        self._validation_text.config(state=tk.DISABLED)
+
+        self._schedule_chart_refresh()
+
+    def _set_validation_text(self, text: str):
+        """Nahradí obsah validačního panelu (thread-safe)."""
+        def _do():
+            self._validation_text.config(state=tk.NORMAL)
+            self._validation_text.delete(1.0, tk.END)
+            self._validation_text.insert(tk.END, text)
+            self._validation_text.config(state=tk.DISABLED)
+        self.root.after(0, _do)
+
+    def _on_tab_changed(self, _event=None):
+        """Přepne aktivní záložku a obnoví graf a auto-název."""
+        self._active_tab = self._notebook.index(self._notebook.select())
+        if self.auto_update_filename.get():
+            self._generate_auto_filename()
+        self._schedule_chart_refresh()
 
     def _create_ramp_section(self, parent):
         """Sekce s nastavením náběhu."""
@@ -172,6 +385,17 @@ class TorqueCurveGeneratorGUI:
             row=2, column=0, sticky="w", padx=8, pady=4)
         tk.Entry(frame, textvariable=self.ramp_degrees, width=10).grid(
             row=2, column=1, padx=4, pady=4)
+
+        # Blok na konci křivky – sdílené pro oba módy (Parametry i Import)
+        sep = tk.Frame(frame, bg="#c8c8c8", height=1)
+        sep.grid(row=3, column=0, columnspan=3, sticky="ew", padx=8, pady=(6, 2))
+        bf = tk.Frame(frame, bg="#f0f0f0")
+        bf.grid(row=4, column=0, columnspan=3, sticky="w", padx=8, pady=(2, 6))
+        tk.Checkbutton(bf, text="Ukončit blokem", variable=self.end_with_block,
+                       bg="#f0f0f0", command=self._on_block_change).pack(side=tk.LEFT)
+        self._block_entry = tk.Entry(bf, textvariable=self.block_torque, width=8, state="disabled")
+        self._block_entry.pack(side=tk.LEFT, padx=(8, 0))
+        tk.Label(bf, text="Nm", bg="#f0f0f0").pack(side=tk.LEFT, padx=(2, 0))
 
     def _create_motor_section(self, parent):
         """Sekce s konfigurací motoru a směru otáčení."""
@@ -268,7 +492,7 @@ class TorqueCurveGeneratorGUI:
             self._canvas = None
             return
 
-        self._fig = Figure(figsize=(7.2, 4.5), dpi=92)
+        self._fig = Figure(figsize=(8.8, 5.6), dpi=92)
         self._fig.patch.set_facecolor(_C_BG)
         self._ax = self._fig.add_subplot(111)
         self._fig.subplots_adjust(left=0.09, right=0.97, top=0.88, bottom=0.12)
@@ -301,6 +525,7 @@ class TorqueCurveGeneratorGUI:
         end_with_block: bool,
         motor_type: str,
         direction: str,
+        import_mode: bool = False,
     ):
         """Překreslí graf s nově vygenerovanými daty.
 
@@ -329,7 +554,14 @@ class TorqueCurveGeneratorGUI:
         block_start_idx = len(raw_data) - 3 if end_with_block else len(raw_data)
 
         # --- Barevná pozadí fází (výrazná, čitelná) ---
-        y_max = target_torque * 1.18 if not end_with_block else max(target_torque, self.block_torque.get()) * 1.18
+        if import_mode:
+            y_max = max((abs(t) for t in torques), default=1.0) * 1.18
+        else:
+            y_max = (
+                target_torque * 1.18
+                if not end_with_block
+                else max(target_torque, self.block_torque.get()) * 1.18
+            )
 
         if ramp_end_idx > 0:
             ax.axvspan(0, angles[ramp_end_idx], alpha=0.30, color=_C_RAMP, zorder=0)
@@ -350,16 +582,17 @@ class TorqueCurveGeneratorGUI:
             ax.axvline(x=angles[block_start_idx], color=_C_BLOCK,
                        linewidth=2.0, alpha=0.9, zorder=1)
 
-        # --- Vodorovné referenční čáry ---
-        ax.axhline(y=target_torque, color=_C_TARGET,
-                   linestyle="--", alpha=0.50, linewidth=1.2,
-                   label=f"Cíl {target_torque:.1f} Nm")
-        ax.axhline(y=target_torque * 0.9, color=_C_M90,
-                   linestyle=":", alpha=0.65, linewidth=1,
-                   label=f"90 % = {target_torque * 0.9:.1f} Nm")
-        ax.axhline(y=target_torque * 0.5, color=_C_M50,
-                   linestyle=":", alpha=0.50, linewidth=1,
-                   label=f"50 % = {target_torque * 0.5:.1f} Nm")
+        # --- Vodorovné referenční čáry (pouze v parametrickém módu) ---
+        if not import_mode:
+            ax.axhline(y=target_torque, color=_C_TARGET,
+                       linestyle="--", alpha=0.50, linewidth=1.2,
+                       label=f"Cíl {target_torque:.1f} Nm")
+            ax.axhline(y=target_torque * 0.9, color=_C_M90,
+                       linestyle=":", alpha=0.65, linewidth=1,
+                       label=f"90 % = {target_torque * 0.9:.1f} Nm")
+            ax.axhline(y=target_torque * 0.5, color=_C_M50,
+                       linestyle=":", alpha=0.50, linewidth=1,
+                       label=f"50 % = {target_torque * 0.5:.1f} Nm")
 
         # --- Samotná křivka ---
         ax.plot(angles, torques, color=_C_CURVE, linewidth=2.5,
@@ -386,11 +619,20 @@ class TorqueCurveGeneratorGUI:
         sign = "+" if (motor_type == "LH") == (direction == "CCW") else "−"
         ax.set_xlabel("Úhel [°]", color=_C_TEXT, fontsize=9)
         ax.set_ylabel("Moment [Nm]", color=_C_TEXT, fontsize=9)
-        ax.set_title(
-            f"{motor_type} {direction}  ({sign})  ·  {self.ramp_type.get()}  ·  "
-            f"{target_torque:.1f} Nm  /  {angles[-1]:.0f}°",
-            color=_C_TARGET, fontsize=9, fontweight="bold",
-        )
+        if import_mode:
+            fname = getattr(self, "_imported_filename", "")
+            short_fname = (fname[:22] + "…") if len(fname) > 22 else fname
+            ax.set_title(
+                f"{motor_type} {direction}  ({sign})  ·  {self.ramp_type.get()}  ·  "
+                f"Import: {short_fname}  /  {angles[-1]:.0f}°",
+                color=_C_TARGET, fontsize=9, fontweight="bold",
+            )
+        else:
+            ax.set_title(
+                f"{motor_type} {direction}  ({sign})  ·  {self.ramp_type.get()}  ·  "
+                f"{target_torque:.1f} Nm  /  {angles[-1]:.0f}°",
+                color=_C_TARGET, fontsize=9, fontweight="bold",
+            )
         ax.set_ylim(bottom=0, top=y_max)
         ax.tick_params(colors=_C_TEXT, labelsize=8)
         for spine in ax.spines.values():
@@ -435,6 +677,18 @@ class TorqueCurveGeneratorGUI:
 
     def _save_csv(self):
         """Validuje vstup a uloží CSV v separátním vlákně. Graf je aktualizován live."""
+        if self._active_tab == 1:
+            # Import mód – ověříme, že jsou data načtena
+            if not self._imported_data:
+                messagebox.showerror(
+                    "Žádná data", "Nejprve načtěte Excel soubor na záložce 'Import XLSX'."
+                )
+                return
+            threading.Thread(
+                target=self._save_csv_import_thread, daemon=True
+            ).start()
+            return
+
         try:
             target = self._safe_get(self.target_torque)
             if target <= 0:
@@ -467,6 +721,71 @@ class TorqueCurveGeneratorGUI:
     def _save_csv_thread(self, working_degrees: float, range_desc: str):
         """Ukládá CSV do souboru, aktualizuje výsledkový panel (běží v threadu)."""
         return self._generate_curve_thread(working_degrees, range_desc)
+
+    def _save_csv_import_thread(self):
+        """Generuje CSV z importovaných dat + náběhu (běží v threadu)."""
+        try:
+            self._set_results("Generuji křivku z importovaných dat…\n")
+
+            ramp_deg = self.ramp_degrees.get()
+            ramp     = self.ramp_type.get()
+            e_block  = self.end_with_block.get()
+            b_torque = self.block_torque.get()
+            motor    = self.motor_type.get()
+            direc    = self.rotation_direction.get()
+
+            raw_data = engine.generate_curve_from_data(
+                self._imported_data, ramp, ramp_deg, e_block, b_torque
+            )
+            self._last_raw_data = raw_data
+
+            mapped_data = engine.apply_direction_mapping(raw_data, motor, direc)
+
+            final_name = self._get_final_filename() or f"import_{self._imported_filename}"
+            csv_path = engine.save_csv(
+                mapped_data, os.path.join(OUTPUT_FOLDER, f"{final_name}.csv")
+            )
+
+            first_torque = abs(self._imported_data[0][0])
+            self.root.after(
+                0,
+                lambda: self._update_chart(
+                    raw_data, ramp_deg, first_torque, e_block, motor, direc, import_mode=True
+                ),
+            )
+            self.root.after(
+                0, lambda: self._show_results_import(csv_path, mapped_data)
+            )
+
+        except Exception as exc:  # noqa: BLE001
+            self.root.after(
+                0, lambda: messagebox.showerror("Chyba při generování", str(exc))
+            )
+
+    def _show_results_import(self, csv_path: str, data: List[Tuple[float, float]]):
+        """Zobrazí výsledky generování z import módu."""
+        self._results_text.config(state=tk.NORMAL)
+        self._results_text.delete(1.0, tk.END)
+
+        t = self._results_text
+        t.insert(tk.END, "IMPORT + GENEROVÁNÍ DOKONČENO\n" + "=" * 30 + "\n\n")
+
+        motor = self.motor_type.get()
+        direc = self.rotation_direction.get()
+        sign  = "+" if (motor == "LH") == (direc == "CCW") else "−"
+
+        torques_abs = [abs(pt[0]) for pt in data]
+        t.insert(tk.END, f"Motor:  {motor} {direc}  ({sign} orientace)\n")
+        t.insert(tk.END, f"Zdroj:  {self._imported_filename}\n")
+        t.insert(tk.END, f"Moment: {min(torques_abs):.2f} – {max(torques_abs):.2f} Nm\n")
+        t.insert(tk.END, f"Náběh:  {self.ramp_type.get()} / {self.ramp_degrees.get():.0f}°\n")
+        if self.end_with_block.get():
+            t.insert(tk.END, f"Blok:   {self.block_torque.get():.0f} Nm\n")
+
+        t.insert(tk.END, f"\nSoubor: {os.path.basename(csv_path)}\n")
+        t.insert(tk.END, f"Bodů: {len(data)}  |  Rozsah: 0 → {abs(data[-1][1]):.0f}°\n")
+
+        self._results_text.config(state=tk.DISABLED)
 
     def _generate_curve_thread(self, working_degrees: float, range_desc: str):
         """Generuje křivku, ukládá CSV, aktualizuje UI (běží v threadu)."""
@@ -605,6 +924,11 @@ class TorqueCurveGeneratorGUI:
         Selže-li validace (neúplný vstup), graf se nepřekreslí.
         """
         self._chart_after_id = None
+
+        if self._active_tab == 1:
+            self._refresh_chart_import()
+            return
+
         target   = self._safe_get(self.target_torque)
         ramp_deg = self._safe_get(self.ramp_degrees, 0.0)
         b_torque = self._safe_get(self.block_torque, 0.0)
@@ -631,7 +955,45 @@ class TorqueCurveGeneratorGUI:
         except Exception:
             pass  # Neúplný vstup – nekreslíme
 
+    def _refresh_chart_import(self):
+        """Obnoví live preview grafu pro import mód."""
+        if not self._imported_data:
+            return
+        ramp_deg = self._safe_get(self.ramp_degrees, 0.0)
+        b_torque = self._safe_get(self.block_torque, 0.0)
+        try:
+            raw_data = engine.generate_curve_from_data(
+                self._imported_data, self.ramp_type.get(),
+                ramp_deg, self.end_with_block.get(), b_torque,
+            )
+            self._last_raw_data = raw_data
+            motor = self.motor_type.get()
+            direc = self.rotation_direction.get()
+            first_torque = abs(self._imported_data[0][0])
+            self._update_chart(
+                raw_data, ramp_deg, first_torque,
+                self.end_with_block.get(), motor, direc, import_mode=True,
+            )
+        except Exception:
+            pass  # Neúplný vstup – nekreslíme
+
     def _generate_auto_filename(self):
+        if self._active_tab == 1:
+            # Import mód – název vychází z xlsx souboru
+            if self._imported_filename:
+                motor      = self.motor_type.get()
+                direc      = self.rotation_direction.get()
+                ramp       = self.ramp_type.get()
+                block_part = (
+                    f"_blok{self._safe_get(self.block_torque):.0f}"
+                    if self.end_with_block.get() else ""
+                )
+                self.filename.set(
+                    f"import_{motor}_{direc}_{ramp}_{self._imported_filename}{block_part}"
+                )
+            self._update_filename_preview()
+            return
+
         torque     = self._safe_get(self.target_torque)
         motor      = self.motor_type.get()
         direc      = self.rotation_direction.get()
