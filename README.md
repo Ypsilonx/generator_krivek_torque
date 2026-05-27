@@ -51,6 +51,10 @@ Veškerá matematika používá standardní knihovnu (`math`) – numpy není po
 Klasický režim: definujete cílový moment, délku pracovní fáze, typ náběhu
 a volitelný blok. Výstupem je hladká křivka s plochou pracovní fází.
 
+Délku pracovní fáze lze zadat jako **otáčky** nebo **stupně** – přepnutí
+jednotek automaticky přepočítá zadanou hodnotu (7 ot. → 2 520°, 2 520° → 7 ot.).
+Maximální povolený rozsah je **100 otáček (36 000°)**.
+
 ### Záložka „Import XLSX" – reálná data z měření
 
 Načtete Excel soubor s naměřenými hodnotami momentu (sloupec A) a úhlu
@@ -120,6 +124,19 @@ Torque [Nm];Angle [°]
 - Kódování: UTF-8
 
 > **Varování**: Formát CSV nesmí být změněn – výstup je konzumován externími systémy.
+
+---
+
+## Výstupní složka
+
+Výchozí výstupní složka je `output/` ve stejném adresáři jako skript (absolutní cesta,
+nezávislá na aktuálním pracovním adresáři při spuštění).
+
+Složku lze kdykoli změnit za běhu aplikace přes sekci **„Výstupní soubor" → tlačítko „Změnit…"**.
+Aplikace nově vybranou složku automaticky vytvoří, pokud neexistuje.
+
+Při pokusu o uložení souboru se stejným názvem, který již v cílové složce existuje, aplikace
+zobrazí dialog **„Přepsat soubor? Ano/Ne"** – přepsání nenastane bez potvrzení.
 
 ---
 
@@ -201,20 +218,30 @@ Třída `TorqueCurveGeneratorGUI` v `torque_gui.py` je organizována do sekcí:
 | `_setup_gui()` | Sestavení layoutu včetně scrollovatelného levého panelu a záložek |
 | `_create_torque_section()` | Záložka Parametry – konstantní křivka |
 | `_create_import_section()` | Záložka Import XLSX – načtení a validace dat |
+| `_create_file_section()` | Sekce výstupního souboru – název, komentář, výstupní složka |
 | `_on_tab_changed()` | Přepínání záložek, obnovení grafu a auto-názvu |
-| `_on_*_change()` | Reakce na změnu widgetů |
+| `_on_range_type_change()` | Přepnutí otáčky ↔ stupně s automatickým přepočtem hodnoty |
+| `_on_*_change()` | Reakce na změnu ostatních widgetů |
 | `_schedule_chart_refresh()` / `_refresh_chart_live()` | Live preview s debouncing (120 ms) |
 | `_refresh_chart_import()` | Live preview pro import mód |
 | `_update_chart(..., import_mode)` | Překreslení grafu (parametr `import_mode` přizpůsobí osy) |
+| `_collect_params()` | Snímek všech GUI hodnot v hlavním vlákně – thread-safe předání do threadů |
+| `_confirm_overwrite(filename)` | Dialog při pokusu přepsat existující soubor |
 | `_save_csv()` | Vstupní bod exportu – větví se dle aktivní záložky |
 | `_save_csv_thread()` / `_generate_curve_thread()` | Export konstantní křivky (vlákno) |
 | `_save_csv_import_thread()` | Export importované křivky (vlákno) |
 | `_load_xlsx_thread()` / `_on_xlsx_loaded()` | Načtení xlsx (vlákno) + zpracování výsledků |
 | `_remove_outliers()` | Interaktivní odebrání odlehlých hodnot |
+| `_browse_output_folder()` | Dialog pro výběr výstupní složky |
+| `_sanitize_filename(text)` | Nahradí zakázané Windows znaky v názvu souboru podtržítkem |
 
 **Tkinter proměnné**: všechny vstupní hodnoty jsou uloženy jako `tk.DoubleVar` / `tk.StringVar` /
 `tk.BooleanVar`. Čtěte je vždy přes `self._safe_get(var)` – nikdy přímým `.get()` na `DoubleVar`
 (způsobuje `TclError` při neúplném vstupu).
+
+**Thread-safety**: Všechny GUI hodnoty potřebné pro generování se čtou v hlavním vlákně
+jedinou metodou `_collect_params()`, která vrátí plain Python `dict`. Thready přijmou
+tento dict jako argument a nepřistupují na `tk.Variable` vůbec.
 
 ---
 

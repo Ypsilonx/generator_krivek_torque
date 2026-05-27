@@ -48,12 +48,18 @@ class TorqueCurveGeneratorGUI:
     """GUI aplikace pro generování momentových křivek se směrovým mapováním a vizualizací."""
 
     def __init__(self):
-        os.makedirs(OUTPUT_FOLDER, exist_ok=True)
-
         self.root = tk.Tk()
         self.root.title("Torque Curve Generator – LH/RH Motor Support")
-        self.root.geometry("1600x900")
-        self.root.minsize(1200, 640)
+
+        # Vycentrování okna na obrazovce
+        win_w, win_h = 1600, 920
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        pos_x = (screen_w - win_w) // 2
+        pos_y = (screen_h - win_h) // 2
+        self.root.geometry(f"{win_w}x{win_h}+{pos_x}+{pos_y}")
+        self.root.minsize(1200, 720)
+
         self.root.configure(bg="#f0f0f0")
 
         # --- stavové proměnné ---
@@ -70,6 +76,11 @@ class TorqueCurveGeneratorGUI:
         self.filename           = tk.StringVar(value="")
         self.comment            = tk.StringVar(value="")
         self.auto_update_filename = tk.BooleanVar(value=True)
+        # Výchozí výstupní složka je absolutní cesta relativní ke skriptu
+        self.output_folder = tk.StringVar(
+            value=os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
+        )
+        os.makedirs(self.output_folder.get(), exist_ok=True)
 
         # raw data (před direction mapping) pro vizualizaci
         self._last_raw_data: Optional[List[Tuple[float, float]]] = None
@@ -268,7 +279,9 @@ class TorqueCurveGeneratorGUI:
     ):
         """Zpracuje výsledky načtení xlsx ve hlavním vlákně."""
         self._imported_data = data
-        self._imported_filename = os.path.splitext(os.path.basename(filepath))[0]
+        self._imported_filename = self._sanitize_filename(
+            os.path.splitext(os.path.basename(filepath))[0]
+        )
 
         # Najdeme outlier_indices z issues (pokud existují)
         self._outlier_indices = []
@@ -431,33 +444,44 @@ class TorqueCurveGeneratorGUI:
         self.rotation_direction.trace("w", lambda *_: self._update_mapping_info())
 
     def _create_file_section(self, parent):
-        """Sekce s nastavením výstupního souboru."""
+        """Sekce s nastavením výstupního souboru a složky."""
         frame = tk.LabelFrame(parent, text="Výstupní soubor",
                               font=("Arial", 9, "bold"), bg="#f0f0f0", fg="#2c3e50")
         frame.pack(fill=tk.X, pady=(0, 6))
 
+        # --- Výstupní složka ---
+        tk.Label(frame, text="Výstupní složka:", bg="#f0f0f0").grid(
+            row=0, column=0, sticky="w", padx=8, pady=(6, 0))
+        folder_row = tk.Frame(frame, bg="#f0f0f0")
+        folder_row.grid(row=1, column=0, columnspan=2, padx=8, pady=2, sticky="ew")
+        tk.Entry(folder_row, textvariable=self.output_folder, state="readonly",
+                 font=("Consolas", 7)).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Button(folder_row, text="Změnit…", command=self._browse_output_folder,
+                  bg="#3498db", fg="white", font=("Arial", 8)).pack(side=tk.LEFT, padx=(4, 0))
+
+        # --- Název souboru ---
         tk.Checkbutton(frame, text="Auto-aktualizace názvu",
                        variable=self.auto_update_filename, bg="#f0f0f0",
                        command=self._on_auto_update_change).grid(
-            row=0, column=0, columnspan=2, sticky="w", padx=8, pady=4)
+            row=2, column=0, columnspan=2, sticky="w", padx=8, pady=(6, 2))
 
         tk.Label(frame, text="Základní název:", bg="#f0f0f0").grid(
-            row=1, column=0, sticky="w", padx=8)
+            row=3, column=0, sticky="w", padx=8)
         self._filename_entry = tk.Entry(frame, textvariable=self.filename,
                                         width=36, state="readonly")
-        self._filename_entry.grid(row=2, column=0, columnspan=2, padx=8, pady=2, sticky="ew")
+        self._filename_entry.grid(row=4, column=0, columnspan=2, padx=8, pady=2, sticky="ew")
 
         tk.Label(frame, text="Komentář:", bg="#f0f0f0").grid(
-            row=3, column=0, sticky="w", padx=8, pady=(6, 2))
+            row=5, column=0, sticky="w", padx=8, pady=(6, 2))
         ce = tk.Entry(frame, textvariable=self.comment, width=36)
-        ce.grid(row=4, column=0, columnspan=2, padx=8, pady=2, sticky="ew")
+        ce.grid(row=6, column=0, columnspan=2, padx=8, pady=2, sticky="ew")
         ce.bind("<KeyRelease>", lambda _e: self._update_filename_if_auto())
 
         tk.Label(frame, text="Finální název:", bg="#f0f0f0",
-                 font=("Arial", 8, "bold")).grid(row=5, column=0, sticky="w", padx=8, pady=(8, 2))
+                 font=("Arial", 8, "bold")).grid(row=7, column=0, sticky="w", padx=8, pady=(8, 2))
         self._final_name_label = tk.Label(frame, text="", bg="#ecf0f1", fg="#2c3e50",
                                           font=("Consolas", 8), relief="sunken", anchor="w")
-        self._final_name_label.grid(row=6, column=0, columnspan=2, padx=8, pady=2, sticky="ew")
+        self._final_name_label.grid(row=8, column=0, columnspan=2, padx=8, pady=2, sticky="ew")
         frame.columnconfigure(0, weight=1)
 
     def _create_buttons(self, parent):
@@ -675,6 +699,26 @@ class TorqueCurveGeneratorGUI:
     # Uložení CSV
     # -----------------------------------------------------------------------
 
+    def _collect_params(self) -> dict:
+        """Načte aktuální hodnoty všech GUI proměnných v hlavním vlákně.
+
+        Volat výhradně z hlavního vlákna. Vrácené plain Python hodnoty jsou
+        thread-safe – thready z nich čtou bez přístupu k tk.Variable.
+
+        Returns:
+            Slovník s aktuálními parametry generování
+        """
+        return {
+            "target":        self._safe_get(self.target_torque),
+            "ramp_deg":      self._safe_get(self.ramp_degrees),
+            "ramp":          self.ramp_type.get(),
+            "e_block":       self.end_with_block.get(),
+            "b_torque":      self._safe_get(self.block_torque),
+            "motor":         self.motor_type.get(),
+            "direc":         self.rotation_direction.get(),
+            "output_folder": self.output_folder.get(),
+        }
+
     def _save_csv(self):
         """Validuje vstup a uloží CSV v separátním vlákně. Graf je aktualizován live."""
         if self._active_tab == 1:
@@ -684,8 +728,13 @@ class TorqueCurveGeneratorGUI:
                     "Žádná data", "Nejprve načtěte Excel soubor na záložce 'Import XLSX'."
                 )
                 return
+            # Načtení GUI hodnot a kontrola přepsání v hlavním vlákně před spuštěním threadu
+            params = self._collect_params()
+            final_name = self._get_final_filename() or f"import_{self._imported_filename}"
+            if not self._confirm_overwrite(final_name):
+                return
             threading.Thread(
-                target=self._save_csv_import_thread, daemon=True
+                target=self._save_csv_import_thread, args=(params,), daemon=True
             ).start()
             return
 
@@ -703,36 +752,70 @@ class TorqueCurveGeneratorGUI:
 
             if working_deg <= 0:
                 raise ValueError("Pracovní rozsah musí být větší než 0")
+            if working_deg > 36_000:
+                raise ValueError(
+                    f"Maximální povolený rozsah je 100 otáček (36 000°).\n"
+                    f"Zadáno: {working_deg:.0f}° ({working_deg / 360:.2f} otáček)"
+                )
+
+            # Načtení GUI hodnot a kontrola přepsání v hlavním vlákně před spuštěním threadu
+            params = self._collect_params()
+            final_name = self._get_final_filename()
+            if not final_name:
+                self._generate_auto_filename()
+                final_name = self._get_final_filename() or "torque_output"
+            if not self._confirm_overwrite(final_name):
+                return
 
             threading.Thread(
                 target=self._save_csv_thread,
-                args=(working_deg, range_desc),
+                args=(working_deg, range_desc, params),
                 daemon=True,
             ).start()
 
         except ValueError as exc:
             messagebox.showerror("Neplatné hodnoty", str(exc))
 
+    def _confirm_overwrite(self, filename: str) -> bool:
+        """Zkontroluje, zda výstupní soubor již existuje, a případně se zeptá na přepsání.
+
+        Musí být voláno z hlavního vlákna (zobrazuje messagebox).
+
+        Args:
+            filename: Název souboru bez přípony a bez cesty ke složce
+
+        Returns:
+            True pokud lze pokračovat (soubor neexistuje nebo uživatel potvrdil přepsání)
+        """
+        csv_path = os.path.join(self.output_folder.get(), f"{filename}.csv")
+        if os.path.exists(csv_path):
+            return messagebox.askyesno(
+                "Přepsat soubor?",
+                f"Soubor '{filename}.csv' již existuje.\nChcete ho přepsat?",
+                icon="warning",
+            )
+        return True
+
     # zachováno pro zpětnou kompatibilitu
     def _generate_curve(self):
         """Alias pro _save_csv (zpětná kompatibilita)."""
         self._save_csv()
 
-    def _save_csv_thread(self, working_degrees: float, range_desc: str):
+    def _save_csv_thread(self, working_degrees: float, range_desc: str, params: dict):
         """Ukládá CSV do souboru, aktualizuje výsledkový panel (běží v threadu)."""
-        return self._generate_curve_thread(working_degrees, range_desc)
+        return self._generate_curve_thread(working_degrees, range_desc, params)
 
-    def _save_csv_import_thread(self):
+    def _save_csv_import_thread(self, params: dict):
         """Generuje CSV z importovaných dat + náběhu (běží v threadu)."""
         try:
             self._set_results("Generuji křivku z importovaných dat…\n")
 
-            ramp_deg = self.ramp_degrees.get()
-            ramp     = self.ramp_type.get()
-            e_block  = self.end_with_block.get()
-            b_torque = self.block_torque.get()
-            motor    = self.motor_type.get()
-            direc    = self.rotation_direction.get()
+            ramp_deg = params["ramp_deg"]
+            ramp     = params["ramp"]
+            e_block  = params["e_block"]
+            b_torque = params["b_torque"]
+            motor    = params["motor"]
+            direc    = params["direc"]
 
             raw_data = engine.generate_curve_from_data(
                 self._imported_data, ramp, ramp_deg, e_block, b_torque
@@ -743,7 +826,7 @@ class TorqueCurveGeneratorGUI:
 
             final_name = self._get_final_filename() or f"import_{self._imported_filename}"
             csv_path = engine.save_csv(
-                mapped_data, os.path.join(OUTPUT_FOLDER, f"{final_name}.csv")
+                mapped_data, os.path.join(params["output_folder"], f"{final_name}.csv")
             )
 
             first_torque = abs(self._imported_data[0][0])
@@ -787,18 +870,18 @@ class TorqueCurveGeneratorGUI:
 
         self._results_text.config(state=tk.DISABLED)
 
-    def _generate_curve_thread(self, working_degrees: float, range_desc: str):
+    def _generate_curve_thread(self, working_degrees: float, range_desc: str, params: dict):
         """Generuje křivku, ukládá CSV, aktualizuje UI (běží v threadu)."""
         try:
             self._set_results("Generuji momentovou křivku…\n")
 
-            ramp_deg = self.ramp_degrees.get()
-            target   = self.target_torque.get()
-            ramp     = self.ramp_type.get()
-            e_block  = self.end_with_block.get()
-            b_torque = self.block_torque.get()
-            motor    = self.motor_type.get()
-            direc    = self.rotation_direction.get()
+            ramp_deg = params["ramp_deg"]
+            target   = params["target"]
+            ramp     = params["ramp"]
+            e_block  = params["e_block"]
+            b_torque = params["b_torque"]
+            motor    = params["motor"]
+            direc    = params["direc"]
 
             # Výpočet – raw data (kladné hodnoty, pro vizualizaci i analýzu)
             raw_data = engine.generate_curve(
@@ -820,7 +903,7 @@ class TorqueCurveGeneratorGUI:
 
             # Uložení (mapped data → CSV)
             csv_path = engine.save_csv(
-                mapped_data, os.path.join(OUTPUT_FOLDER, f"{final_name}.csv")
+                mapped_data, os.path.join(params["output_folder"], f"{final_name}.csv")
             )
 
             # Aktualizace UI ve hlavním vlákně
@@ -892,10 +975,18 @@ class TorqueCurveGeneratorGUI:
     # -----------------------------------------------------------------------
 
     def _on_range_type_change(self):
-        if self.range_type.get() == "rotations":
+        """Přepíná vstupní pole mezi otáčkami a stupni s automatickým přepočtem hodnoty."""
+        new_type = self.range_type.get()
+        if new_type == "rotations":
+            # Přepínáme ze stupňů na otáčky – vydělíme 360
+            deg_val = self._safe_get(self.working_degrees)
+            self.working_rotations.set(round(deg_val / 360, 6))
             self._range_label.config(text="Počet otáček:")
             self._range_entry.config(textvariable=self.working_rotations)
         else:
+            # Přepínáme z otáček na stupně – vynásobíme 360
+            rot_val = self._safe_get(self.working_rotations)
+            self.working_degrees.set(round(rot_val * 360, 4))
             self._range_label.config(text="Úhel [°]:")
             self._range_entry.config(textvariable=self.working_degrees)
 
@@ -1015,8 +1106,25 @@ class TorqueCurveGeneratorGUI:
 
     def _get_final_filename(self) -> str:
         base    = self.filename.get().strip()
-        comment = self.comment.get().strip()
+        comment = self._sanitize_filename(self.comment.get().strip())
         return f"{base}_{comment}" if comment else base
+
+    @staticmethod
+    def _sanitize_filename(text: str) -> str:
+        """Nahradí znaky zakázané ve Windows názvech souborů podtržítkem.
+
+        Zakázané znaky na Windows: < > : " / \\ | ? *
+        Mezery jsou také nahrazeny podtržítkem pro bezpečnost.
+
+        Args:
+            text: Vstupní řetězec (např. komentář nebo název xlsx)
+
+        Returns:
+            Řetězec bezpečný pro použití jako název souboru
+        """
+        for ch in '<>:"/\\|?* ':
+            text = text.replace(ch, '_')
+        return text.strip('_')
 
     def _safe_get(self, var: tk.Variable, default: float = 0.0) -> float:
         """Bezpečně načte float hodnotu z tk.Variable.
@@ -1063,17 +1171,33 @@ class TorqueCurveGeneratorGUI:
             self._filename_entry.config(state="normal")
 
     def _open_output_folder(self):
+        folder = self.output_folder.get()
         try:
             if os.name == "nt":
-                # Absolutní cesta zamezí path injection při neobvyklých znacích
-                os.startfile(os.path.abspath(OUTPUT_FOLDER))
+                os.startfile(os.path.abspath(folder))
             else:
                 import subprocess
                 subprocess.run(
-                    ["xdg-open", os.path.abspath(OUTPUT_FOLDER)], check=False
+                    ["xdg-open", os.path.abspath(folder)], check=False
                 )
         except Exception as exc:
             messagebox.showerror("Chyba", f"Nelze otevřít složku: {exc}")
+
+    def _browse_output_folder(self):
+        """Otevře dialog pro výběr výstupní složky a uloží ji jako novou výchozí cestu.
+
+        Složka je ihned vytvořena pokud neexistuje.
+        """
+        from tkinter import filedialog  # noqa: PLC0415
+        current = self.output_folder.get()
+        initial = current if os.path.isdir(current) else os.path.expanduser("~")
+        folder = filedialog.askdirectory(
+            title="Vyberte výstupní složku pro CSV soubory",
+            initialdir=initial,
+        )
+        if folder:
+            self.output_folder.set(folder)
+            os.makedirs(folder, exist_ok=True)
 
     def _reset_form(self):
         self.target_torque.set(15.0)
