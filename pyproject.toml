@@ -1,0 +1,10 @@
+[project]
+name = "generator-krivek-torque"
+version = "0.1.0"
+description = "Nástroj pro generování momentových křivek servomotorů ve formátu CSV"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "matplotlib>=3.5.0",
+    "openpyxl>=3.1.0",
+]

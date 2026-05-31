@@ -19,7 +19,6 @@ ENV/
 output/
 
 # IDE a editory
-.vscode/
 .idea/
 *.swp
 *.swo

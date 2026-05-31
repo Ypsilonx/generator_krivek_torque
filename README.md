@@ -22,21 +22,31 @@ Ostatní moduly ji pouze volají – nikdy neduplikují.
 
 ## Rychlý start
 
+### Varianta A – UV (doporučeno)
+
 ```powershell
-# Aktivace prostředí
-.\.venv\Scripts\Activate.ps1
+# Vytvoří .venv a nainstaluje závislosti
+uv sync
 
 # GUI aplikace (doporučeno)
+uv run python torque_gui.py
+
+# CLI aplikace
+uv run python torque_curve_generator.py
+```
+
+### Varianta B – pip (bez UV)
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+
+# GUI aplikace
 python torque_gui.py
 
 # CLI aplikace
 python torque_curve_generator.py
-```
-
-### Závislosti
-
-```
-pip install -r requirements.txt
 ```
 
 Požaduje `matplotlib>=3.5.0` a `openpyxl>=3.1.0`.
